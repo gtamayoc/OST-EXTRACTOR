@@ -226,6 +226,15 @@ def process_and_save_email(message, relative_folder_path, output_base_path):
         if not os.path.exists(folder_output_dir):
             os.makedirs(folder_output_dir)
 
+        # Generar nombre del archivo y verificar si ya existe (evita procesar adjuntos en duplicados)
+        safe_subject = clean_filename(subject)
+        filename = f"{received_date_only}_{safe_subject}.md"
+        filepath = os.path.join(folder_output_dir, filename)
+
+        if os.path.exists(filepath):
+            print(f"[OMITIDO - DUPLICADO] '{subject}' ya existe en el destino ({filename}).")
+            return False, "__SKIPPED_DUPLICATE__"
+
         # Procesar Adjuntos (siempre se guardan en la carpeta central 'attachments' en el root de la salida)
         attachments_list = []
         attachments_links_md = []
@@ -308,19 +317,6 @@ def process_and_save_email(message, relative_folder_path, output_base_path):
                             raise att_file_err
                 except Exception as att_err:
                     print(f"Error procesando adjunto #{att_idx} de '{subject}': {att_err}")
-
-        # Generar nombre del archivo único para evitar sobrescribir
-        # Formato: YYYY-MM-DD_Asunto_Limpio.md
-        safe_subject = clean_filename(subject)
-        filename = f"{received_date_only}_{safe_subject}.md"
-        filepath = os.path.join(folder_output_dir, filename)
-        
-        # Si el archivo ya existe, añadir sufijo incremental
-        counter = 1
-        while os.path.exists(filepath):
-            filename = f"{received_date_only}_{safe_subject}_{counter}.md"
-            filepath = os.path.join(folder_output_dir, filename)
-            counter += 1
 
         # Formatear datos JSON para YAML seguro (evita errores de parseo en Obsidian)
         sender_tag = clean_tag(sender_name)
@@ -483,6 +479,8 @@ def process_all_emails_recursively(folder, current_rel_path, output_base_path, s
                     print(f"[{stats['success']}] Extraído: '{getattr(item, 'Subject', 'Sin Asunto')}' -> {filename}")
                 elif filename == "__SKIPPED__":
                     stats["skipped_filter"] += 1
+                elif filename == "__SKIPPED_DUPLICATE__":
+                    stats["skipped_duplicate"] += 1
                 else:
                     stats["error"] += 1
     except Exception as e:
@@ -547,6 +545,7 @@ def extract_emails_to_obsidian():
             
             success_count = 0
             skipped_filter_count = 0
+            skipped_duplicate_count = 0
             error_count = 0
 
             for candidate in candidates:
@@ -560,12 +559,15 @@ def extract_emails_to_obsidian():
                     print(f"[{success_count}/{MAX_EMAILS}] Extraído: '{getattr(candidate['item'], 'Subject', 'Sin Asunto')}' -> {filename}")
                 elif filename == "__SKIPPED__":
                     skipped_filter_count += 1
+                elif filename == "__SKIPPED_DUPLICATE__":
+                    skipped_duplicate_count += 1
                 else:
                     error_count += 1
 
             print("\n=== RESUMEN DE EJECUCIÓN (MODO LIMITADO) ===")
             print(f"Correos exportados correctamente:  {success_count}")
             print(f"Correos omitidos por filtro:       {skipped_filter_count}")
+            print(f"Correos omitidos por duplicado:    {skipped_duplicate_count}")
             print(f"Errores en procesamiento:          {error_count}")
             if success_count < MAX_EMAILS:
                 print(f"[AVISO] Solo se encontraron {success_count} correos válidos (se solicitaron {MAX_EMAILS}).")
@@ -574,7 +576,7 @@ def extract_emails_to_obsidian():
             
         else:
             print("[INFO] Modo Migración Completa ACTIVO: Procesando TODOS los correos de todas las carpetas...")
-            stats = {"success": 0, "skipped_class": 0, "skipped_filter": 0, "error": 0}
+            stats = {"success": 0, "skipped_class": 0, "skipped_filter": 0, "skipped_duplicate": 0, "error": 0}
             
             # Procesar en flujo recursivo directo
             process_all_emails_recursively(root_folder, "", OBSIDIAN_VAULT_PATH, stats)
@@ -583,6 +585,7 @@ def extract_emails_to_obsidian():
             print(f"Correos exportados correctamente:  {stats['success']}")
             print(f"Elementos omitidos (no correos):   {stats['skipped_class']}")
             print(f"Correos omitidos por filtro:       {stats['skipped_filter']}")
+            print(f"Correos omitidos por duplicado:    {stats['skipped_duplicate']}")
             print(f"Errores en procesamiento:          {stats['error']}")
             print("==================================================")
 
