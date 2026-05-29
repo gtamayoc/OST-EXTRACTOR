@@ -7,6 +7,32 @@ import uuid
 import shutil
 from datetime import datetime
 from dotenv import load_dotenv
+import builtins
+import sys
+
+# Redefinir print para evitar caídas por UnicodeEncodeError en consolas Windows
+_original_print = builtins.print
+
+def safe_print(*args, **kwargs):
+    try:
+        _original_print(*args, **kwargs)
+    except UnicodeEncodeError:
+        file = kwargs.get('file', sys.stdout)
+        sep = kwargs.get('sep', ' ')
+        end = kwargs.get('end', '\n')
+        message = sep.join(str(arg) for arg in args)
+        encoding = getattr(file, 'encoding', None) or 'utf-8'
+        try:
+            clean_message = message.encode(encoding, errors='replace').decode(encoding)
+            _original_print(clean_message, **kwargs)
+        except Exception:
+            try:
+                ascii_message = message.encode('ascii', errors='backslashreplace').decode('ascii')
+                _original_print(ascii_message, **kwargs)
+            except Exception:
+                pass
+
+builtins.print = safe_print
 
 # Caché global de adjuntos para evitar descargas duplicadas
 ATTACHMENT_CACHE = {}
@@ -79,6 +105,19 @@ if os.path.exists(dotenv_path):
 else:
     load_dotenv()
 
+class EnvConfigLoader:
+    @staticmethod
+    def get_list(var_name):
+        val = os.getenv(var_name, "")
+        if not val:
+            return []
+        return [item.strip() for item in val.split(",") if item.strip()]
+
+    @staticmethod
+    def get_string(var_name):
+        val = os.getenv(var_name, "")
+        return val.strip() if val else None
+
 # Configuración de salida para tu bóveda de Obsidian
 OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", os.path.dirname(__file__))
 LIMIT_EMAILS = os.getenv("LIMIT_EMAILS", "true").lower() in ("true", "1", "yes")
@@ -90,6 +129,146 @@ _skip_senders_raw = os.getenv("SKIP_SENDERS", "")
 _skip_subjects_raw = os.getenv("SKIP_SUBJECTS", "")
 SKIP_SENDERS = [s.strip().lower() for s in _skip_senders_raw.split(",") if s.strip()]
 SKIP_SUBJECTS = [s.strip().lower() for s in _skip_subjects_raw.split(",") if s.strip()]
+
+# Nuevos Filtros configurables de Carpetas y Correos
+ALLOWED_FOLDERS = EnvConfigLoader.get_list("ALLOWED_FOLDERS")
+EXCLUDED_FOLDERS = EnvConfigLoader.get_list("EXCLUDED_FOLDERS")
+FILTER_EMAIL_FROM = EnvConfigLoader.get_string("FILTER_EMAIL_FROM")
+FILTER_EMAIL_SUBJECT = EnvConfigLoader.get_string("FILTER_EMAIL_SUBJECT")
+FILTER_EMAIL_CONTAINS = EnvConfigLoader.get_string("FILTER_EMAIL_CONTAINS")
+
+# Mostrar logs de configuración detectada
+if ALLOWED_FOLDERS:
+    print(f"[CONFIG] Carpetas permitidas detectadas (ALLOWED_FOLDERS): {', '.join(ALLOWED_FOLDERS)}")
+if EXCLUDED_FOLDERS:
+    print(f"[CONFIG] Carpetas excluidas detectadas (EXCLUDED_FOLDERS): {', '.join(EXCLUDED_FOLDERS)}")
+if FILTER_EMAIL_FROM:
+    print(f"[CONFIG] Filtro de remitente (FILTER_EMAIL_FROM): '{FILTER_EMAIL_FROM}'")
+if FILTER_EMAIL_SUBJECT:
+    print(f"[CONFIG] Filtro de asunto (FILTER_EMAIL_SUBJECT): '{FILTER_EMAIL_SUBJECT}'")
+if FILTER_EMAIL_CONTAINS:
+    print(f"[CONFIG] Filtro de contenido del cuerpo (FILTER_EMAIL_CONTAINS): '{FILTER_EMAIL_CONTAINS}'")
+
+class FolderFilterManager:
+    def __init__(self, allowed, excluded):
+        self.allowed = allowed
+        self.excluded = excluded
+        
+        # Priority rule: If allowed folders are set, ignore excluded folders.
+        if self.allowed:
+            self.active_allowed = True
+            self.active_excluded = False
+        else:
+            self.active_allowed = False
+            self.active_excluded = bool(self.excluded)
+
+    @staticmethod
+    def _normalize_path(path):
+        if not path:
+            return ""
+        path = path.replace("/", "\\")
+        parts = [p.strip() for p in path.split("\\") if p.strip()]
+        return "\\".join(parts).lower()
+
+    def _matches_filter(self, folder_name, relative_path, filter_item):
+        norm_filter = self._normalize_path(filter_item)
+        norm_rel = self._normalize_path(relative_path)
+        norm_name = folder_name.strip().lower()
+        
+        if norm_rel == norm_filter:
+            return True
+        if norm_name == norm_filter:
+            return True
+        if norm_rel.startswith(norm_filter + "\\"):
+            return True
+        return False
+
+    def _is_parent_of_any_allowed(self, folder_name, relative_path):
+        norm_rel = self._normalize_path(relative_path)
+        if not norm_rel:
+            return True
+            
+        for allowed_item in self.allowed:
+            norm_allowed = self._normalize_path(allowed_item)
+            if norm_allowed.startswith(norm_rel + "\\"):
+                return True
+        return False
+
+    def should_process_folder(self, folder_name, relative_path):
+        if not self.active_allowed and not self.active_excluded:
+            return True, None
+            
+        if self.active_allowed:
+            for allowed_item in self.allowed:
+                if self._matches_filter(folder_name, relative_path, allowed_item):
+                    return True, None
+            return False, "no está en la lista de permitidas"
+            
+        if self.active_excluded:
+            for excluded_item in self.excluded:
+                if self._matches_filter(folder_name, relative_path, excluded_item):
+                    return False, "excluida por filtro"
+            return True, None
+
+    def should_traverse_folder(self, folder_name, relative_path):
+        if not self.active_allowed and not self.active_excluded:
+            return True
+            
+        if self.active_allowed:
+            for allowed_item in self.allowed:
+                if self._matches_filter(folder_name, relative_path, allowed_item):
+                    return True
+            if self._is_parent_of_any_allowed(folder_name, relative_path):
+                return True
+            return False
+            
+        if self.active_excluded:
+            for excluded_item in self.excluded:
+                if self._matches_filter(folder_name, relative_path, excluded_item):
+                    return False
+            return True
+
+    def get_exclude_reason(self, folder_name, relative_path):
+        should_proc, reason = self.should_process_folder(folder_name, relative_path)
+        if not should_proc:
+            return reason
+        if not self.should_traverse_folder(folder_name, relative_path):
+            if self.active_excluded:
+                return "excluida por filtro"
+            return "no está en la lista de permitidas"
+        return "desconocido"
+
+class EmailFilterManager:
+    def __init__(self, filter_from, filter_subject, filter_contains):
+        self.filter_from = filter_from.strip().lower() if filter_from else None
+        self.filter_subject = filter_subject.strip().lower() if filter_subject else None
+        self.filter_contains = filter_contains.strip().lower() if filter_contains else None
+        self.has_filters = bool(self.filter_from or self.filter_subject or self.filter_contains)
+
+    def should_process_email(self, sender_email, sender_name, subject, body):
+        if not self.has_filters:
+            return True, None
+
+        if self.filter_from:
+            email_lower = (sender_email or "").lower()
+            name_lower = (sender_name or "").lower()
+            if self.filter_from not in email_lower and self.filter_from not in name_lower:
+                return False, f"remitente no coincide con FILTER_EMAIL_FROM ('{self.filter_from}')"
+
+        if self.filter_subject:
+            subject_lower = (subject or "").lower()
+            if self.filter_subject not in subject_lower:
+                return False, f"asunto no contiene FILTER_EMAIL_SUBJECT ('{self.filter_subject}')"
+
+        if self.filter_contains:
+            body_lower = (body or "").lower()
+            if self.filter_contains not in body_lower:
+                return False, f"cuerpo no contiene FILTER_EMAIL_CONTAINS ('{self.filter_contains}')"
+
+        return True, None
+
+folder_filter_manager = FolderFilterManager(ALLOWED_FOLDERS, EXCLUDED_FOLDERS)
+email_filter_manager = EmailFilterManager(FILTER_EMAIL_FROM, FILTER_EMAIL_SUBJECT, FILTER_EMAIL_CONTAINS)
 
 def clean_filename(title):
     """Limpia el asunto para que sea un nombre de archivo válido en Windows."""
@@ -213,6 +392,12 @@ def process_and_save_email(message, relative_folder_path, output_base_path):
 
         # Cuerpo del correo
         body = getattr(message, "Body", "")
+
+        # Verificar nuevos filtros positivos de correo
+        email_ok, email_reason = email_filter_manager.should_process_email(sender_email, sender_name, subject, body)
+        if not email_ok:
+            print(f"[OMITIDO - FILTRO] '{subject}' ({sender_name} <{sender_email}>) — {email_reason}")
+            return False, "__SKIPPED_EMAIL_FILTER__"
 
         # Crear carpeta de destino: plano por año si ORGANIZE_BY_YEAR está activo.
         # La carpeta de Outlook (relative_folder_path) se ignora intencionalmente para
@@ -397,44 +582,47 @@ def collect_emails_recursively(folder, current_rel_path, candidate_list, limit_a
     Si limit_active es True, se ordenan los correos de cada carpeta y se toman los más recientes
     para evitar saturación de memoria.
     """
-    try:
-        items = folder.Items
-        # Intentar verificar si hay elementos
-        count = items.Count
-        if count > 0:
-            # Intentar ordenar para procesar los más recientes primero
-            try:
-                items.Sort("[ReceivedTime]", True)
-            except Exception:
-                pass
-
-            local_added = 0
-            for idx in range(1, count + 1):
+    # Determinar si debemos procesar los correos de esta carpeta
+    should_proc, _ = folder_filter_manager.should_process_folder(folder.Name, current_rel_path)
+    if should_proc:
+        try:
+            items = folder.Items
+            # Intentar verificar si hay elementos
+            count = items.Count
+            if count > 0:
+                # Intentar ordenar para procesar los más recientes primero
                 try:
-                    item = items.Item(idx)
+                    items.Sort("[ReceivedTime]", True)
                 except Exception:
-                    continue
+                    pass
 
-                # Filtrar solo MailItem (Class 43)
-                try:
-                    msg_class = item.Class
-                except Exception:
-                    msg_class = 0
+                local_added = 0
+                for idx in range(1, count + 1):
+                    try:
+                        item = items.Item(idx)
+                    except Exception:
+                        continue
 
-                if msg_class == 43:
-                    rec_time = get_received_time(item) or datetime.min
-                    candidate_list.append({
-                        "item": item,
-                        "folder_path": current_rel_path,
-                        "time": rec_time
-                    })
-                    local_added += 1
-                    
-                    # Si el límite está activo, no recolectamos más de lo necesario de una sola carpeta
-                    if limit_active and local_added >= max_per_folder:
-                        break
-    except Exception as e:
-        print(f"No se pudo acceder a los correos de la carpeta '{current_rel_path}': {e}")
+                    # Filtrar solo MailItem (Class 43)
+                    try:
+                        msg_class = item.Class
+                    except Exception:
+                        msg_class = 0
+
+                    if msg_class == 43:
+                        rec_time = get_received_time(item) or datetime.min
+                        candidate_list.append({
+                            "item": item,
+                            "folder_path": current_rel_path,
+                            "time": rec_time
+                        })
+                        local_added += 1
+                        
+                        # Si el límite está activo, no recolectamos más de lo necesario de una sola carpeta
+                        if limit_active and local_added >= max_per_folder:
+                            break
+        except Exception as e:
+            print(f"No se pudo acceder a los correos de la carpeta '{current_rel_path}': {e}")
 
     # Procesar subcarpetas recursivamente
     try:
@@ -443,7 +631,12 @@ def collect_emails_recursively(folder, current_rel_path, candidate_list, limit_a
             try:
                 sub = subfolders.Item(idx)
                 sub_rel_path = os.path.join(current_rel_path, sub.Name) if current_rel_path else sub.Name
-                collect_emails_recursively(sub, sub_rel_path, candidate_list, limit_active, max_per_folder)
+                
+                if folder_filter_manager.should_traverse_folder(sub.Name, sub_rel_path):
+                    collect_emails_recursively(sub, sub_rel_path, candidate_list, limit_active, max_per_folder)
+                else:
+                    reason = folder_filter_manager.get_exclude_reason(sub.Name, sub_rel_path)
+                    print(f"[OMITIDA - CARPETA] '{sub_rel_path}' (Motivo: {reason})")
             except Exception:
                 continue
     except Exception:
@@ -454,37 +647,41 @@ def process_all_emails_recursively(folder, current_rel_path, output_base_path, s
     Recorre recursivamente las carpetas y procesa/guarda cada correo directamente (Streaming).
     Ideal para migración completa ya que no mantiene referencias masivas en memoria.
     """
-    try:
-        items = folder.Items
-        count = items.Count
-        if count > 0:
-            for idx in range(1, count + 1):
-                try:
-                    item = items.Item(idx)
-                except Exception:
-                    continue
+    should_proc, _ = folder_filter_manager.should_process_folder(folder.Name, current_rel_path)
+    if should_proc:
+        try:
+            items = folder.Items
+            count = items.Count
+            if count > 0:
+                for idx in range(1, count + 1):
+                    try:
+                        item = items.Item(idx)
+                    except Exception:
+                        continue
 
-                try:
-                    msg_class = item.Class
-                except Exception:
-                    msg_class = 0
+                    try:
+                        msg_class = item.Class
+                    except Exception:
+                        msg_class = 0
 
-                if msg_class != 43:
-                    stats["skipped_class"] += 1
-                    continue
+                    if msg_class != 43:
+                        stats["skipped_class"] += 1
+                        continue
 
-                success, filename = process_and_save_email(item, current_rel_path, output_base_path)
-                if success:
-                    stats["success"] += 1
-                    print(f"[{stats['success']}] Extraído: '{getattr(item, 'Subject', 'Sin Asunto')}' -> {filename}")
-                elif filename == "__SKIPPED__":
-                    stats["skipped_filter"] += 1
-                elif filename == "__SKIPPED_DUPLICATE__":
-                    stats["skipped_duplicate"] += 1
-                else:
-                    stats["error"] += 1
-    except Exception as e:
-        print(f"Error procesando correos en carpeta '{current_rel_path}': {e}")
+                    success, filename = process_and_save_email(item, current_rel_path, output_base_path)
+                    if success:
+                        stats["success"] += 1
+                        print(f"[{stats['success']}] Extraído: '{getattr(item, 'Subject', 'Sin Asunto')}' -> {filename}")
+                    elif filename == "__SKIPPED__":
+                        stats["skipped_filter"] += 1
+                    elif filename == "__SKIPPED_EMAIL_FILTER__":
+                        stats["skipped_email_filter"] += 1
+                    elif filename == "__SKIPPED_DUPLICATE__":
+                        stats["skipped_duplicate"] += 1
+                    else:
+                        stats["error"] += 1
+        except Exception as e:
+            print(f"Error procesando correos en carpeta '{current_rel_path}': {e}")
 
     # Procesar subcarpetas
     try:
@@ -493,7 +690,12 @@ def process_all_emails_recursively(folder, current_rel_path, output_base_path, s
             try:
                 sub = subfolders.Item(idx)
                 sub_rel_path = os.path.join(current_rel_path, sub.Name) if current_rel_path else sub.Name
-                process_all_emails_recursively(sub, sub_rel_path, output_base_path, stats)
+                
+                if folder_filter_manager.should_traverse_folder(sub.Name, sub_rel_path):
+                    process_all_emails_recursively(sub, sub_rel_path, output_base_path, stats)
+                else:
+                    reason = folder_filter_manager.get_exclude_reason(sub.Name, sub_rel_path)
+                    print(f"[OMITIDA - CARPETA] '{sub_rel_path}' (Motivo: {reason})")
             except Exception:
                 continue
     except Exception:
@@ -545,6 +747,7 @@ def extract_emails_to_obsidian():
             
             success_count = 0
             skipped_filter_count = 0
+            skipped_email_filter_count = 0
             skipped_duplicate_count = 0
             error_count = 0
 
@@ -559,6 +762,8 @@ def extract_emails_to_obsidian():
                     print(f"[{success_count}/{MAX_EMAILS}] Extraído: '{getattr(candidate['item'], 'Subject', 'Sin Asunto')}' -> {filename}")
                 elif filename == "__SKIPPED__":
                     skipped_filter_count += 1
+                elif filename == "__SKIPPED_EMAIL_FILTER__":
+                    skipped_email_filter_count += 1
                 elif filename == "__SKIPPED_DUPLICATE__":
                     skipped_duplicate_count += 1
                 else:
@@ -566,7 +771,8 @@ def extract_emails_to_obsidian():
 
             print("\n=== RESUMEN DE EJECUCIÓN (MODO LIMITADO) ===")
             print(f"Correos exportados correctamente:  {success_count}")
-            print(f"Correos omitidos por filtro:       {skipped_filter_count}")
+            print(f"Correos omitidos por exclusión:    {skipped_filter_count}")
+            print(f"Correos omitidos por filtro:       {skipped_email_filter_count}")
             print(f"Correos omitidos por duplicado:    {skipped_duplicate_count}")
             print(f"Errores en procesamiento:          {error_count}")
             if success_count < MAX_EMAILS:
@@ -576,7 +782,14 @@ def extract_emails_to_obsidian():
             
         else:
             print("[INFO] Modo Migración Completa ACTIVO: Procesando TODOS los correos de todas las carpetas...")
-            stats = {"success": 0, "skipped_class": 0, "skipped_filter": 0, "skipped_duplicate": 0, "error": 0}
+            stats = {
+                "success": 0,
+                "skipped_class": 0,
+                "skipped_filter": 0,
+                "skipped_email_filter": 0,
+                "skipped_duplicate": 0,
+                "error": 0
+            }
             
             # Procesar en flujo recursivo directo
             process_all_emails_recursively(root_folder, "", OBSIDIAN_VAULT_PATH, stats)
@@ -584,7 +797,8 @@ def extract_emails_to_obsidian():
             print("\n=== RESUMEN DE EJECUCIÓN (MIGRACIÓN COMPLETA) ===")
             print(f"Correos exportados correctamente:  {stats['success']}")
             print(f"Elementos omitidos (no correos):   {stats['skipped_class']}")
-            print(f"Correos omitidos por filtro:       {stats['skipped_filter']}")
+            print(f"Correos omitidos por exclusión:    {stats['skipped_filter']}")
+            print(f"Correos omitidos por filtro:       {stats['skipped_email_filter']}")
             print(f"Correos omitidos por duplicado:    {stats['skipped_duplicate']}")
             print(f"Errores en procesamiento:          {stats['error']}")
             print("==================================================")
