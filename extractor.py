@@ -9,6 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import builtins
 import sys
+import index_manager
 
 # Redefinir print para evitar caídas por UnicodeEncodeError en consolas Windows
 _original_print = builtins.print
@@ -137,6 +138,16 @@ FILTER_EMAIL_FROM = EnvConfigLoader.get_string("FILTER_EMAIL_FROM")
 FILTER_EMAIL_SUBJECT = EnvConfigLoader.get_string("FILTER_EMAIL_SUBJECT")
 FILTER_EMAIL_CONTAINS = EnvConfigLoader.get_string("FILTER_EMAIL_CONTAINS")
 
+# Configuración para omitir imágenes de firma repetitivas
+SKIP_SIGNATURE_IMAGES = os.getenv("SKIP_SIGNATURE_IMAGES", "true").lower() in ("true", "1", "yes")
+try:
+    SIGNATURE_IMAGE_MAX_SIZE_KB = float(os.getenv("SIGNATURE_IMAGE_MAX_SIZE_KB", "25"))
+except Exception:
+    SIGNATURE_IMAGE_MAX_SIZE_KB = 25.0
+
+# Expresión regular fija/hardcoded para evitar malas configuraciones del usuario
+SIGNATURE_IMAGE_PATTERN = r"^image\d{3,4}(_\d+)?$"
+
 # Mostrar logs de configuración detectada
 if ALLOWED_FOLDERS:
     print(f"[CONFIG] Carpetas permitidas detectadas (ALLOWED_FOLDERS): {', '.join(ALLOWED_FOLDERS)}")
@@ -148,6 +159,8 @@ if FILTER_EMAIL_SUBJECT:
     print(f"[CONFIG] Filtro de asunto (FILTER_EMAIL_SUBJECT): '{FILTER_EMAIL_SUBJECT}'")
 if FILTER_EMAIL_CONTAINS:
     print(f"[CONFIG] Filtro de contenido del cuerpo (FILTER_EMAIL_CONTAINS): '{FILTER_EMAIL_CONTAINS}'")
+if SKIP_SIGNATURE_IMAGES:
+    print(f"[CONFIG] Filtrado de imágenes de firma: ACTIVO (Límite: {SIGNATURE_IMAGE_MAX_SIZE_KB} KB, Patrón: '{SIGNATURE_IMAGE_PATTERN}')")
 
 class FolderFilterManager:
     def __init__(self, allowed, excluded):
@@ -330,7 +343,7 @@ def get_received_time(message):
         except Exception:
             return None
 
-def process_and_save_email(message, relative_folder_path, output_base_path):
+def process_and_save_email(message, relative_folder_path, output_base_path, index_data=None):
     """Extrae la información de un mensaje de correo y lo guarda en formato Markdown."""
     try:
         # Extraer campos principales
@@ -341,6 +354,18 @@ def process_and_save_email(message, relative_folder_path, output_base_path):
             sender_email = getattr(message, "SenderEmailAddress", "")
         except Exception:
             sender_email = ""
+
+        # Obtener IDs primero para validación de índice
+        conversation_id = getattr(message, "ConversationID", "")
+        entry_id = getattr(message, "EntryID", "")
+
+        # Si ya existe en el índice como válido y el archivo existe, omitir antes de cualquier procesamiento
+        if entry_id and index_data is not None and entry_id in index_data.get("emails", {}):
+            email_info = index_data["emails"][entry_id]
+            if email_info.get("status") == "valid":
+                fpath = os.path.join(output_base_path, email_info["filepath"].replace("/", os.sep))
+                if os.path.exists(fpath):
+                    return False, "__SKIPPED_DUPLICATE__"
 
         # ── Verificar filtros de exclusión antes de continuar ────────────────
         skip, skip_reason = should_skip_email(subject, sender_email, sender_name)
@@ -366,10 +391,6 @@ def process_and_save_email(message, relative_folder_path, output_base_path):
         # Obtener categorías
         categories_raw = getattr(message, "Categories", "")
         categories = [c.strip() for c in categories_raw.split(",")] if categories_raw else []
-
-        # Obtener IDs
-        conversation_id = getattr(message, "ConversationID", "")
-        entry_id = getattr(message, "EntryID", "")
 
         # Fechas
         received_time = get_received_time(message)
@@ -448,6 +469,16 @@ def process_and_save_email(message, relative_folder_path, output_base_path):
                     attachment = attachments.Item(att_idx)
                     att_name = attachment.FileName
                     if att_name:
+                        # Evaluar si es una imagen de firma repetitiva para omitirla
+                        if SKIP_SIGNATURE_IMAGES:
+                            att_size = getattr(attachment, "Size", 0)
+                            base_name, ext = os.path.splitext(att_name.lower())
+                            if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+                                if re.match(SIGNATURE_IMAGE_PATTERN, base_name):
+                                    size_kb = att_size / 1024.0
+                                    if size_kb <= SIGNATURE_IMAGE_MAX_SIZE_KB:
+                                        print(f"[OMITIDO - IMAGEN FIRMA] '{att_name}' (Tamaño: {size_kb:.1f} KB)")
+                                        continue
                         # Generar un nombre de archivo temporal único para evitar bloqueos por procesos concurrentes en Windows
                         temp_filename = f"temp_{uuid.uuid4().hex}"
                         temp_path = os.path.join(temp_dir, temp_filename)
@@ -571,6 +602,24 @@ def process_and_save_email(message, relative_folder_path, output_base_path):
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(md_content)
 
+        # Registrar en el índice
+        if index_data is not None and entry_id:
+            index_data["emails"][entry_id] = {
+                "filepath": os.path.relpath(filepath, output_base_path).replace("\\", "/"),
+                "subject": subject,
+                "sender_name": sender_name,
+                "sender_email": sender_email,
+                "received_time": received_str,
+                "sent_time": sent_str,
+                "outlook_folder": relative_folder_path,
+                "categories": [clean_tag(cat) for cat in categories],
+                "importance": importance_str,
+                "attachments": attachments_list,
+                "status": "valid"
+            }
+            # Guardar el índice inmediatamente en disco
+            index_manager.save_index(output_base_path, index_data)
+
         return True, filename
     except Exception as e:
         print(f"Error procesando un correo específico: {e}")
@@ -642,7 +691,7 @@ def collect_emails_recursively(folder, current_rel_path, candidate_list, limit_a
     except Exception:
         pass
 
-def process_all_emails_recursively(folder, current_rel_path, output_base_path, stats):
+def process_all_emails_recursively(folder, current_rel_path, output_base_path, stats, index_data=None):
     """
     Recorre recursivamente las carpetas y procesa/guarda cada correo directamente (Streaming).
     Ideal para migración completa ya que no mantiene referencias masivas en memoria.
@@ -668,7 +717,21 @@ def process_all_emails_recursively(folder, current_rel_path, output_base_path, s
                         stats["skipped_class"] += 1
                         continue
 
-                    success, filename = process_and_save_email(item, current_rel_path, output_base_path)
+                    # Verificar de forma incremental antes de procesar
+                    try:
+                        eid = item.EntryID
+                    except Exception:
+                        eid = ""
+
+                    if eid and index_data is not None and eid in index_data.get("emails", {}):
+                        email_info = index_data["emails"][eid]
+                        if email_info.get("status") == "valid":
+                            fpath = os.path.join(output_base_path, email_info["filepath"].replace("/", os.sep))
+                            if os.path.exists(fpath):
+                                stats["skipped_duplicate"] += 1
+                                continue
+
+                    success, filename = process_and_save_email(item, current_rel_path, output_base_path, index_data)
                     if success:
                         stats["success"] += 1
                         print(f"[{stats['success']}] Extraído: '{getattr(item, 'Subject', 'Sin Asunto')}' -> {filename}")
@@ -692,7 +755,7 @@ def process_all_emails_recursively(folder, current_rel_path, output_base_path, s
                 sub_rel_path = os.path.join(current_rel_path, sub.Name) if current_rel_path else sub.Name
                 
                 if folder_filter_manager.should_traverse_folder(sub.Name, sub_rel_path):
-                    process_all_emails_recursively(sub, sub_rel_path, output_base_path, stats)
+                    process_all_emails_recursively(sub, sub_rel_path, output_base_path, stats, index_data)
                 else:
                     reason = folder_filter_manager.get_exclude_reason(sub.Name, sub_rel_path)
                     print(f"[OMITIDA - CARPETA] '{sub_rel_path}' (Motivo: {reason})")
@@ -713,6 +776,17 @@ def extract_emails_to_obsidian():
     print("ya que Outlook gestiona la base de datos automáticamente en segundo plano.")
     print("=======================================================")
     
+    # Preparar diccionario de filtros activos para documentar en el índice
+    active_filters = {
+        "ALLOWED_FOLDERS": ",".join(ALLOWED_FOLDERS) if ALLOWED_FOLDERS else "",
+        "EXCLUDED_FOLDERS": ",".join(EXCLUDED_FOLDERS) if EXCLUDED_FOLDERS else "",
+        "FILTER_EMAIL_FROM": FILTER_EMAIL_FROM or "",
+        "FILTER_EMAIL_SUBJECT": FILTER_EMAIL_SUBJECT or "",
+        "FILTER_EMAIL_CONTAINS": FILTER_EMAIL_CONTAINS or "",
+        "SKIP_SENDERS": ",".join(SKIP_SENDERS) if SKIP_SENDERS else "",
+        "SKIP_SUBJECTS": ",".join(SKIP_SUBJECTS) if SKIP_SUBJECTS else ""
+    }
+    
     try:
         # Inicializar cliente COM de Outlook
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -729,9 +803,35 @@ def extract_emails_to_obsidian():
         
         # Cargar/inicializar el caché de adjuntos
         load_attachments_cache(OBSIDIAN_VAULT_PATH)
-        
+
+        # Cargar e Inicializar el Índice Central (.extractor_index.json)
+        index_data = index_manager.load_index(OBSIDIAN_VAULT_PATH)
+
+        # Revalidar filtros sobre los correos existentes (Eliminación en cascada)
+        index_manager.revalidate_filters(
+            OBSIDIAN_VAULT_PATH, index_data, folder_filter_manager, email_filter_manager, SKIP_SENDERS, SKIP_SUBJECTS
+        )
+
+        # Limpiar adjuntos huérfanos y actualizar caché
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cache_path = os.path.join(script_dir, CACHE_FILE_NAME)
+        index_manager.cleanup_orphan_attachments(OBSIDIAN_VAULT_PATH, index_data, cache_path)
+
+        # Calcular correos válidos actuales
+        valid_emails = {eid: info for eid, info in index_data.get("emails", {}).items() if info.get("status") == "valid"}
+        current_valid_count = len(valid_emails)
+
         if LIMIT_EMAILS:
             print(f"[INFO] Modo Limitado ACTIVO: exportando los {MAX_EMAILS} correos más recientes aceptados por los filtros...")
+            print(f"[INFO] Total de correos válidos actuales en la bóveda: {current_valid_count}")
+
+            remaining_to_extract = MAX_EMAILS - current_valid_count
+            if remaining_to_extract <= 0:
+                print(f"[INFO] Ya se ha alcanzado o superado el límite de {MAX_EMAILS} correos válidos. No se descargarán nuevos correos.")
+                return
+
+            print(f"[INFO] Se necesitan descargar {remaining_to_extract} nuevos correos para completar el límite de {MAX_EMAILS}.")
+            
             candidates = []
             
             # Recolectar un buffer amplio de candidatos para compensar los que sean filtrados.
@@ -743,7 +843,7 @@ def extract_emails_to_obsidian():
             # Ordenar todos los candidatos por fecha descendente (más recientes primero)
             candidates.sort(key=lambda x: x["time"], reverse=True)
             
-            print(f"[INFO] Se encontraron {len(candidates)} correos candidatos. Procesando hasta obtener {MAX_EMAILS} exportados...")
+            print(f"[INFO] Se encontraron {len(candidates)} correos candidatos en Outlook. Procesando de forma incremental...")
             
             success_count = 0
             skipped_filter_count = 0
@@ -753,13 +853,25 @@ def extract_emails_to_obsidian():
 
             for candidate in candidates:
                 # Parar en cuanto se alcance el objetivo de exportaciones
-                if success_count >= MAX_EMAILS:
+                if success_count >= remaining_to_extract:
                     break
 
-                success, filename = process_and_save_email(candidate["item"], candidate["folder_path"], OBSIDIAN_VAULT_PATH)
+                # Obtener el EntryID de forma segura para validar si ya fue procesado
+                try:
+                    eid = candidate["item"].EntryID
+                except Exception:
+                    eid = ""
+
+                if eid and eid in index_data.get("emails", {}) and index_data["emails"][eid].get("status") == "valid":
+                    fpath = os.path.join(OBSIDIAN_VAULT_PATH, index_data["emails"][eid]["filepath"].replace("/", os.sep))
+                    if os.path.exists(fpath):
+                        # Ya está procesado e indexado, lo omitimos para no gastar tiempo
+                        continue
+
+                success, filename = process_and_save_email(candidate["item"], candidate["folder_path"], OBSIDIAN_VAULT_PATH, index_data)
                 if success:
                     success_count += 1
-                    print(f"[{success_count}/{MAX_EMAILS}] Extraído: '{getattr(candidate['item'], 'Subject', 'Sin Asunto')}' -> {filename}")
+                    print(f"[{success_count}/{remaining_to_extract}] Extraído: '{getattr(candidate['item'], 'Subject', 'Sin Asunto')}' -> {filename}")
                 elif filename == "__SKIPPED__":
                     skipped_filter_count += 1
                 elif filename == "__SKIPPED_EMAIL_FILTER__":
@@ -770,13 +882,15 @@ def extract_emails_to_obsidian():
                     error_count += 1
 
             print("\n=== RESUMEN DE EJECUCIÓN (MODO LIMITADO) ===")
-            print(f"Correos exportados correctamente:  {success_count}")
+            print(f"Nuevos correos exportados:         {success_count}")
+            print(f"Correos ya existentes en la bóveda: {current_valid_count}")
+            print(f"Correos totales válidos actuales:  {current_valid_count + success_count}")
             print(f"Correos omitidos por exclusión:    {skipped_filter_count}")
             print(f"Correos omitidos por filtro:       {skipped_email_filter_count}")
             print(f"Correos omitidos por duplicado:    {skipped_duplicate_count}")
             print(f"Errores en procesamiento:          {error_count}")
-            if success_count < MAX_EMAILS:
-                print(f"[AVISO] Solo se encontraron {success_count} correos válidos (se solicitaron {MAX_EMAILS}).")
+            if current_valid_count + success_count < MAX_EMAILS:
+                print(f"[AVISO] Solo se encontraron {current_valid_count + success_count} correos válidos en total (se solicitaron {MAX_EMAILS}).")
             print("=============================================")
 
             
@@ -791,15 +905,15 @@ def extract_emails_to_obsidian():
                 "error": 0
             }
             
-            # Procesar en flujo recursivo directo
-            process_all_emails_recursively(root_folder, "", OBSIDIAN_VAULT_PATH, stats)
+            # Procesar en flujo recursivo directo de forma incremental
+            process_all_emails_recursively(root_folder, "", OBSIDIAN_VAULT_PATH, stats, index_data)
             
             print("\n=== RESUMEN DE EJECUCIÓN (MIGRACIÓN COMPLETA) ===")
-            print(f"Correos exportados correctamente:  {stats['success']}")
+            print(f"Nuevos correos exportados:         {stats['success']}")
+            print(f"Correos ya existentes (omitidos):  {stats['skipped_duplicate']}")
             print(f"Elementos omitidos (no correos):   {stats['skipped_class']}")
             print(f"Correos omitidos por exclusión:    {stats['skipped_filter']}")
             print(f"Correos omitidos por filtro:       {stats['skipped_email_filter']}")
-            print(f"Correos omitidos por duplicado:    {stats['skipped_duplicate']}")
             print(f"Errores en procesamiento:          {stats['error']}")
             print("==================================================")
 
@@ -809,6 +923,11 @@ def extract_emails_to_obsidian():
     finally:
         # Asegurar que se guarde el caché de adjuntos
         save_attachments_cache()
+        # Asegurar que se guarde el índice final y se genere _Correos.md
+        if 'index_data' in locals():
+            index_manager.save_index(OBSIDIAN_VAULT_PATH, index_data)
+            index_manager.generate_obsidian_index(OBSIDIAN_VAULT_PATH, index_data, active_filters)
+            
         # Limpiar la carpeta temporal de descargas de adjuntos
         temp_dir = os.path.join(OBSIDIAN_VAULT_PATH, "attachments", "temp")
         if os.path.exists(temp_dir):

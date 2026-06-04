@@ -1,6 +1,6 @@
 @echo off
 echo =======================================================
-echo    Iniciando el Extractor de Correos a Obsidian
+echo       Extractor de Correos a Obsidian (WPOSS)
 echo =======================================================
 
 :: Verificar si Python esta instalado
@@ -49,11 +49,38 @@ if exist "%~dp0requirements.txt" (
     echo [WARNING] No se encontro el archivo requirements.txt. Intentando ejecutar de todas formas.
 )
 
-:: Ejecutar el script extractor
-echo [INFO] Iniciando extractor.py...
+echo.
+echo Seleccione el modo de ejecucion:
+echo [1] Extraer correos normales de Outlook activo (Bandeja de Entrada, etc.)
+echo [2] Analizar y Extraer correos del Backup OST de 7.59 GB
+echo [3] Salir
+echo.
+set /p OPTION="Ingrese una opcion [1, 2 o 3]: "
+
+if "%OPTION%"=="1" goto run_normal
+if "%OPTION%"=="2" goto run_backup
+if "%OPTION%"=="3" goto exit_script
+echo Opcion invalida.
+goto end_script
+
+:run_normal
 echo -------------------------------------------------------
+echo [INFO] Iniciando extractor.py...
 python "%~dp0extractor.py"
 echo -------------------------------------------------------
+goto end_script
 
+:run_backup
+echo -------------------------------------------------------
+echo [INFO] Iniciando analyze_backup_ost.py...
+python "%~dp0analyze_backup_ost.py"
+echo -------------------------------------------------------
+goto end_script
+
+:exit_script
+echo Saliendo del programa...
+goto end_script
+
+:end_script
 echo [INFO] Proceso finalizado.
 pause
