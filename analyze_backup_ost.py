@@ -1,12 +1,124 @@
 import win32com.client
 import os
 import sys
+from dotenv import load_dotenv
+
+# Cargar variables de entorno del archivo .env local
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+else:
+    load_dotenv()
+
+CUSTOM_DATA_FILE_PATH = os.getenv("CUSTOM_DATA_FILE_PATH", "")
+
+def get_outlook_root_folder(outlook):
+    """
+    Obtiene la carpeta raíz de Outlook a procesar.
+    Si se configura CUSTOM_DATA_FILE_PATH en .env, intenta montar el archivo (si es PST)
+    o muestra una advertencia explicativa con instrucciones de conversión (si es OST).
+    Retorna (root_folder, mounted_store_root_to_remove)
+    """
+    custom_path = CUSTOM_DATA_FILE_PATH.strip()
+    if not custom_path:
+        if outlook.Folders.Count < 1:
+            raise RuntimeError("No se encontraron cuentas de correo configuradas en Outlook.")
+        root = outlook.Folders.Item(1)
+        print(f"[INFO] Conectado con éxito a la cuenta principal activa: '{root.Name}'")
+        return root, None
+
+    # Normalizar ruta
+    abs_path = os.path.abspath(custom_path)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError(f"El archivo de datos especificado en CUSTOM_DATA_FILE_PATH no existe: {abs_path}")
+
+    ext = os.path.splitext(abs_path)[1].lower()
+
+    if ext == '.pst':
+        print(f"[INFO] Cargando archivo de datos PST externo de forma dinámica: {abs_path}")
+        try:
+            # Montar el archivo PST
+            outlook.AddStore(abs_path)
+        except Exception as e:
+            raise RuntimeError(f"Error al montar el archivo PST en Outlook: {e}")
+
+        # Buscar la carpeta raíz del PST montado
+        store_root = None
+        for store in outlook.Stores:
+            try:
+                if store.FilePath and os.path.normpath(store.FilePath).lower() == os.path.normpath(abs_path).lower():
+                    store_root = store.GetRootFolder()
+                    break
+            except Exception:
+                pass
+
+        if not store_root:
+            for folder in outlook.Folders:
+                try:
+                    if hasattr(folder, 'Store') and folder.Store.FilePath:
+                        if os.path.normpath(folder.Store.FilePath).lower() == os.path.normpath(abs_path).lower():
+                            store_root = folder
+                            break
+                except Exception:
+                    pass
+
+        if not store_root:
+            raise RuntimeError(f"El archivo PST se agregó a la sesión, pero no se pudo encontrar su carpeta raíz para la ruta: {abs_path}")
+
+        print(f"[OK] Conectado exitosamente al archivo PST: '{store_root.Name}'")
+        return store_root, store_root
+
+    elif ext == '.ost':
+        print("\n" + "="*80)
+        print("[ERROR] NO SE PUEDE MONTAR UN ARCHIVO .OST DIRECTAMENTE EN OUTLOOK VIA API")
+        print("="*80)
+        print("La API de Microsoft Outlook (MAPI) no permite cargar archivos .ost")
+        print("adicionales de forma dinámica en una sesión activa (solo admite archivos .pst).")
+        print("\n>>> ¿CÓMO HACER EL CAMBIO DE OST A PST? <<<")
+        print("--------------------------------------------------------------------------------")
+        print("MÉTODO A: EXPORTAR DESDE OUTLOOK (Recomendado si su cuenta aún está activa)")
+        print("  1. Abra Outlook normalmente.")
+        print("  2. Vaya al menú: Archivo > Abrir y exportar > Importar o exportar.")
+        print("  3. Seleccione 'Exportar a un archivo' y haga clic en Siguiente.")
+        print("  4. Seleccione 'Archivo de datos de Outlook (.pst)' y haga clic en Siguiente.")
+        print("  5. Seleccione la carpeta principal de su cuenta (marque 'Incluir subcarpetas').")
+        print("  6. Elija la ruta donde guardar el archivo .pst y haga clic en Finalizar.")
+        print("  7. Configure la ruta de este nuevo archivo .pst en su archivo .env:")
+        print("     CUSTOM_DATA_FILE_PATH=C:\\Ruta\\A\\Su\\archivo.pst")
+        print("\nMÉTODO B: MÉTODO MANUAL DE INTERCAMBIO TEMPORAL (Si el OST es un backup huérfano)")
+        print("  1. Cierre Outlook por completo.")
+        print("  2. Vaya a C:\\Users\\WPOSS\\AppData\\Local\\Microsoft\\Outlook")
+        print("  3. Renombre su archivo .ost activo agregándole '.ACTIVO' al final.")
+        print("  4. Copie el archivo .ost de respaldo y péguelo en esa carpeta con el nombre")
+        print("     exacto del archivo activo original.")
+        print("  5. DESCONECTE el internet de su equipo y abra la aplicación de Outlook de")
+        print("     escritorio (se abrirá sin conexión y mostrará el contenido del backup).")
+        print("  6. Realice la exportación a .pst siguiendo los pasos del MÉTODO A (puntos 2-6).")
+        print("  7. Cierre Outlook, elimine el archivo .ost de respaldo temporal, devuelva el")
+        print("     nombre original al activo, reconecte internet y configure la ruta del .pst.")
+        print("\nMÉTODO C: CONVERSOR DE TERCEROS")
+        print("  Use un software de conversión de OST a PST (como Stellar Converter para OST,")
+        print("  Kernel para OST, u otro) para convertir directamente el archivo .ost a .pst.")
+        print("="*80 + "\n")
+        raise RuntimeError("Carga directa de .ost no soportada por la API de Outlook.")
+    else:
+        raise ValueError(f"Extensión de archivo no soportada: '{ext}'. Debe ser un archivo .pst.")
 
 def analyze_outlook_storage(report_path):
     outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    root = outlook.Folders.Item(1)
-    
-    print(f"\n[OK] Conectado exitosamente al archivo OST temporal en Outlook: '{root.Name}'")
+    root, mounted_store = get_outlook_root_folder(outlook)
+    try:
+        analyze_outlook_storage_internal(root, report_path)
+    finally:
+        if mounted_store is not None:
+            try:
+                outlook.RemoveStore(mounted_store)
+                print("[INFO] Archivo PST externo desmontado correctamente de Outlook.")
+            except Exception as remove_err:
+                print(f"[WARNING] No se pudo desmontar el archivo PST externo de Outlook: {remove_err}")
+
+def analyze_outlook_storage_internal(root, report_path):
+    print(f"\n[OK] Conectado exitosamente al archivo de datos en Outlook: '{root.Name}'")
     print("Analizando carpetas y tamaños de adjuntos (esto puede demorar unos minutos)...")
     
     folder_stats = []
@@ -136,11 +248,31 @@ def main():
     print("Asegúrese de que la aplicación Outlook de escritorio esté abierta.")
     print("=========================================================\n")
     
-    print("PREPARACIÓN:")
-    print("---------------------------------------------------------")
-    print("1. Abra la aplicación de Outlook de escritorio.")
-    print("2. Confirme que la cuenta o el archivo OST a analizar esté activo.")
-    print("---------------------------------------------------------")
+    custom_path = CUSTOM_DATA_FILE_PATH.strip()
+    if custom_path:
+        abs_path = os.path.abspath(custom_path)
+        if not os.path.exists(abs_path):
+            print(f"[ERROR] El archivo de datos especificado no existe: {abs_path}")
+            sys.exit(1)
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext == '.ost':
+            try:
+                # Mostrar instrucciones de conversión de OST a PST y terminar inmediatamente
+                get_outlook_root_folder(None)
+            except Exception:
+                sys.exit(1)
+                
+        print("PREPARACIÓN:")
+        print("---------------------------------------------------------")
+        print("1. Abra la aplicación de Outlook de escritorio.")
+        print(f"2. Se analizará el archivo configurado: {custom_path}")
+        print("---------------------------------------------------------")
+    else:
+        print("PREPARACIÓN:")
+        print("---------------------------------------------------------")
+        print("1. Abra la aplicación de Outlook de escritorio.")
+        print("2. Confirme que la cuenta o el archivo OST a analizar esté activo.")
+        print("---------------------------------------------------------")
     
     input("\nUna vez que Outlook esté listo, presiona ENTER aquí...")
     

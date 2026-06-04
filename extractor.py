@@ -124,6 +124,7 @@ OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", os.path.dirname(__file__)
 LIMIT_EMAILS = os.getenv("LIMIT_EMAILS", "true").lower() in ("true", "1", "yes")
 MAX_EMAILS = int(os.getenv("MAX_EMAILS", "10"))
 ORGANIZE_BY_YEAR = os.getenv("ORGANIZE_BY_YEAR", "true").lower() in ("true", "1", "yes")
+CUSTOM_DATA_FILE_PATH = os.getenv("CUSTOM_DATA_FILE_PATH", "")
 
 # Filtros de exclusión: si la variable está vacía la lista queda vacía y no filtra nada
 _skip_senders_raw = os.getenv("SKIP_SENDERS", "")
@@ -764,6 +765,98 @@ def process_all_emails_recursively(folder, current_rel_path, output_base_path, s
     except Exception:
         pass
 
+def get_outlook_root_folder(outlook):
+    """
+    Obtiene la carpeta raíz de Outlook a procesar.
+    Si se configura CUSTOM_DATA_FILE_PATH en .env, intenta montar el archivo (si es PST)
+    o muestra una advertencia explicativa con instrucciones de conversión (si es OST).
+    Retorna (root_folder, mounted_store_root_to_remove)
+    """
+    custom_path = CUSTOM_DATA_FILE_PATH.strip()
+    if not custom_path:
+        if outlook.Folders.Count < 1:
+            raise RuntimeError("No se encontraron cuentas de correo configuradas en Outlook.")
+        root = outlook.Folders.Item(1)
+        print(f"[INFO] Conectado con éxito a la cuenta principal activa: '{root.Name}'")
+        return root, None
+
+    # Normalizar ruta
+    abs_path = os.path.abspath(custom_path)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError(f"El archivo de datos especificado en CUSTOM_DATA_FILE_PATH no existe: {abs_path}")
+
+    ext = os.path.splitext(abs_path)[1].lower()
+
+    if ext == '.pst':
+        print(f"[INFO] Cargando archivo de datos PST externo de forma dinámica: {abs_path}")
+        try:
+            # Montar el archivo PST
+            outlook.AddStore(abs_path)
+        except Exception as e:
+            raise RuntimeError(f"Error al montar el archivo PST en Outlook: {e}")
+
+        # Buscar la carpeta raíz del PST montado
+        store_root = None
+        for store in outlook.Stores:
+            try:
+                if store.FilePath and os.path.normpath(store.FilePath).lower() == os.path.normpath(abs_path).lower():
+                    store_root = store.GetRootFolder()
+                    break
+            except Exception:
+                pass
+
+        if not store_root:
+            for folder in outlook.Folders:
+                try:
+                    if hasattr(folder, 'Store') and folder.Store.FilePath:
+                        if os.path.normpath(folder.Store.FilePath).lower() == os.path.normpath(abs_path).lower():
+                            store_root = folder
+                            break
+                except Exception:
+                    pass
+
+        if not store_root:
+            raise RuntimeError(f"El archivo PST se agregó a la sesión, pero no se pudo encontrar su carpeta raíz para la ruta: {abs_path}")
+
+        print(f"[OK] Conectado exitosamente al archivo PST: '{store_root.Name}'")
+        return store_root, store_root
+
+    elif ext == '.ost':
+        print("\n" + "="*80)
+        print("[ERROR] NO SE PUEDE MONTAR UN ARCHIVO .OST DIRECTAMENTE EN OUTLOOK VIA API")
+        print("="*80)
+        print("La API de Microsoft Outlook (MAPI) no permite cargar archivos .ost")
+        print("adicionales de forma dinámica en una sesión activa (solo admite archivos .pst).")
+        print("\n>>> ¿CÓMO HACER EL CAMBIO DE OST A PST? <<<")
+        print("--------------------------------------------------------------------------------")
+        print("MÉTODO A: EXPORTAR DESDE OUTLOOK (Recomendado si su cuenta aún está activa)")
+        print("  1. Abra Outlook normalmente.")
+        print("  2. Vaya al menú: Archivo > Abrir y exportar > Importar o exportar.")
+        print("  3. Seleccione 'Exportar a un archivo' y haga clic en Siguiente.")
+        print("  4. Seleccione 'Archivo de datos de Outlook (.pst)' y haga clic en Siguiente.")
+        print("  5. Seleccione la carpeta principal de su cuenta (marque 'Incluir subcarpetas').")
+        print("  6. Elija la ruta donde guardar el archivo .pst y haga clic en Finalizar.")
+        print("  7. Configure la ruta de este nuevo archivo .pst en su archivo .env:")
+        print("     CUSTOM_DATA_FILE_PATH=C:\\Ruta\\A\\Su\\archivo.pst")
+        print("\nMÉTODO B: MÉTODO MANUAL DE INTERCAMBIO TEMPORAL (Si el OST es un backup huérfano)")
+        print("  1. Cierre Outlook por completo.")
+        print("  2. Vaya a C:\\Users\\WPOSS\\AppData\\Local\\Microsoft\\Outlook")
+        print("  3. Renombre su archivo .ost activo agregándole '.ACTIVO' al final.")
+        print("  4. Copie el archivo .ost de respaldo y péguelo en esa carpeta con el nombre")
+        print("     exacto del archivo activo original.")
+        print("  5. DESCONECTE el internet de su equipo y abra la aplicación de Outlook de")
+        print("     escritorio (se abrirá sin conexión y mostrará el contenido del backup).")
+        print("  6. Realice la exportación a .pst siguiendo los pasos del MÉTODO A (puntos 2-6).")
+        print("  7. Cierre Outlook, elimine el archivo .ost de respaldo temporal, devuelva el")
+        print("     nombre original al activo, reconecte internet y configure la ruta del .pst.")
+        print("\nMÉTODO C: CONVERSOR DE TERCEROS")
+        print("  Use un software de conversión de OST a PST (como Stellar Converter para OST,")
+        print("  Kernel para OST, u otro) para convertir directamente el archivo .ost a .pst.")
+        print("="*80 + "\n")
+        raise RuntimeError("Carga directa de .ost no soportada por la API de Outlook.")
+    else:
+        raise ValueError(f"Extensión de archivo no soportada: '{ext}'. Debe ser un archivo .pst.")
+
 def extract_emails_to_obsidian():
     # Asegurar que exista la carpeta de salida
     if not os.path.exists(OBSIDIAN_VAULT_PATH):
@@ -787,19 +880,13 @@ def extract_emails_to_obsidian():
         "SKIP_SUBJECTS": ",".join(SKIP_SUBJECTS) if SKIP_SUBJECTS else ""
     }
     
+    mounted_store = None
     try:
         # Inicializar cliente COM de Outlook
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
         
-        # Verificar si hay carpetas/cuentas disponibles
-        if outlook.Folders.Count < 1:
-            print("[ERROR] No se encontraron cuentas de correo ni archivos de datos configurados en Outlook.")
-            print("Por favor, asegúrate de tener Outlook instalado y configurado con tu cuenta.")
-            return
-
-        # Seleccionar la primera cuenta/almacén de datos disponible (ID 1)
-        root_folder = outlook.Folders.Item(1)
-        print(f"[INFO] Conectado con éxito a la cuenta principal: '{root_folder.Name}'")
+        # Obtener la carpeta raíz (ya sea de la cuenta activa o de un PST montado)
+        root_folder, mounted_store = get_outlook_root_folder(outlook)
         
         # Cargar/inicializar el caché de adjuntos
         load_attachments_cache(OBSIDIAN_VAULT_PATH)
@@ -936,6 +1023,14 @@ def extract_emails_to_obsidian():
                 print("[INFO] Carpeta temporal de descargas de adjuntos limpia con éxito.")
             except Exception as clean_err:
                 print(f"[WARNING] No se pudo eliminar la carpeta temporal {temp_dir}: {clean_err}")
+
+        # Desmontar archivo PST si se montó dinámicamente
+        if 'mounted_store' in locals() and mounted_store is not None:
+            try:
+                outlook.RemoveStore(mounted_store)
+                print("[INFO] Archivo PST externo desmontado correctamente de Outlook.")
+            except Exception as remove_err:
+                print(f"[WARNING] No se pudo desmontar el archivo PST externo de Outlook: {remove_err}")
 
 if __name__ == "__main__":
     extract_emails_to_obsidian()
